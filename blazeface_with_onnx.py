@@ -36,10 +36,6 @@ class BlazeFaceWithOnnx:
         
         self.anchors = None
 
-    def _device(self):
-        """Which device (CPU or GPU) is being used by this model?"""
-        return self.classifier_8.weight.device     
-    
     def load_anchors(self, path):
         self.anchors = np.load(path).astype(np.float32)
         assert(self.anchors.ndim == 2)
@@ -62,7 +58,7 @@ class BlazeFaceWithOnnx:
             A tensor with face detections.
         """
         img = img.transpose(2, 0, 1)
-        return self.predict_on_batch(np.expand_dims(img, 0))[0]
+        return self.predict_on_batch(img[np.newaxis, :])[0]
 
     def predict_on_batch(self, x):
         """Makes a prediction on a batch of images.
@@ -102,7 +98,7 @@ class BlazeFaceWithOnnx:
         filtered_detections = []
         for i in range(len(detections)):
             faces = self._weighted_non_max_suppression(detections[i])
-            faces = torch.stack(faces) if len(faces) > 0 else torch.zeros((0, 17))
+            faces = np.stack(faces, axis=0) if len(faces) > 0 else np.zeros((0, 17))
             filtered_detections.append(faces)
 
         return filtered_detections
@@ -153,11 +149,8 @@ class BlazeFaceWithOnnx:
             # scores = detection_scores[i, mask[i]].unsqueeze(dim=-1)
             scores = detection_scores[i, mask[i]]
             scores = scores[:, np.newaxis]
-            print(boxes.shape)
-            print(scores.shape)
             # output_detections.append(torch.cat((boxes, scores), dim=-1))
             output_detections.append(np.concatenate((boxes, scores), axis=-1))
-            print(output_detections[i].shape)
 
         return output_detections
 
@@ -187,7 +180,7 @@ class BlazeFaceWithOnnx:
 
         return boxes
 
-    def _weighted_non_max_suppression(self, detections):
+    def _weighted_non_max_suppression(self, detections: np.ndarray):
         """The alternative NMS method as mentioned in the BlazeFace paper:
 
         "We replace the suppression algorithm with a blending strategy that
@@ -211,8 +204,8 @@ class BlazeFaceWithOnnx:
         output_detections = []
 
         # Sort the detections from highest to lowest score.
-        remaining = torch.argsort(detections[:, 16], descending=True)
-
+        remaining = np.argsort(detections[:, 16])[::-1]
+         
         while len(remaining) > 0:
             detection = detections[remaining[0]]
 
@@ -231,12 +224,12 @@ class BlazeFaceWithOnnx:
 
             # Take an average of the coordinates from the overlapping
             # detections, weighted by their confidence scores.
-            weighted_detection = detection.clone()
+            weighted_detection = np.copy(detection)
             if len(overlapping) > 1:
                 coordinates = detections[overlapping, :16]
                 scores = detections[overlapping, 16:17]
-                total_score = scores.sum()
-                weighted = (coordinates * scores).sum(dim=0) / total_score
+                total_score = np.sum(scores)
+                weighted = np.sum(coordinates * scores, axis=0) / total_score
                 weighted_detection[:16] = weighted
                 weighted_detection[16] = total_score / len(overlapping)
 
@@ -247,7 +240,7 @@ class BlazeFaceWithOnnx:
 
 # IOU code from https://github.com/amdegroot/ssd.pytorch/blob/master/layers/box_utils.py
 
-def intersect(box_a, box_b):
+def intersect(box_a: np.ndarray, box_b: np.ndarray) -> np.ndarray:
     """ We resize both tensors to [A,B,2] without new malloc:
     [A,2] -> [A,1,2] -> [A,B,2]
     [B,2] -> [1,B,2] -> [A,B,2]
@@ -258,17 +251,16 @@ def intersect(box_a, box_b):
     Return:
       (tensor) intersection area, Shape: [A,B].
     """
-    A = box_a.size(0)
-    B = box_b.size(0)
-    max_xy = torch.min(box_a[:, 2:].unsqueeze(1).expand(A, B, 2),
-                       box_b[:, 2:].unsqueeze(0).expand(A, B, 2))
-    min_xy = torch.max(box_a[:, :2].unsqueeze(1).expand(A, B, 2),
-                       box_b[:, :2].unsqueeze(0).expand(A, B, 2))
-    inter = torch.clamp((max_xy - min_xy), min=0)
+    A = box_a.shape[0]
+    B = box_b.shape[0]
+    max_xy = np.minimum(np.tile(box_a[:, 2:][:, np.newaxis], (A, B)),
+                        np.tile(box_b[:, 2:][np.newaxis, :], (A, B)))
+    min_xy = np.maximum(np.tile(box_a[:, :2][:, np.newaxis], (A, B)),
+                           np.tile(box_b[:, :2][np.newaxis, :], (A, B)))
+    inter = np.clip((max_xy - min_xy), 0, None)
     return inter[:, :, 0] * inter[:, :, 1]
 
-
-def jaccard(box_a, box_b):
+def jaccard(box_a: np.ndarray, box_b: np.ndarray) -> np.ndarray:
     """Compute the jaccard overlap of two sets of boxes.  The jaccard overlap
     is simply the intersection over union of two boxes.  Here we operate on
     ground truth boxes and default boxes.
@@ -281,14 +273,20 @@ def jaccard(box_a, box_b):
         jaccard overlap: (tensor) Shape: [box_a.size(0), box_b.size(0)]
     """
     inter = intersect(box_a, box_b)
-    area_a = ((box_a[:, 2]-box_a[:, 0]) *
-              (box_a[:, 3]-box_a[:, 1])).unsqueeze(1).expand_as(inter)  # [A,B]
-    area_b = ((box_b[:, 2]-box_b[:, 0]) *
-              (box_b[:, 3]-box_b[:, 1])).unsqueeze(0).expand_as(inter)  # [A,B]
+    area_a = np.broadcast_to(
+        ((box_a[:, 2]-box_a[:, 0]) * (box_a[:, 3]-box_a[:, 1]))[:, np.newaxis], 
+        inter.shape
+    )  # [A,B]
+    area_b = np.broadcast_to(
+        ((box_b[:, 2]-box_b[:, 0]) * (box_b[:, 3]-box_b[:, 1]))[np.newaxis, :],
+        inter.shape
+    )  # [A,B]
     union = area_a + area_b - inter
     return inter / union  # [A,B]
 
 
-def overlap_similarity(box, other_boxes):
+def overlap_similarity(box: np.ndarray, other_boxes: np.ndarray):
     """Computes the IOU between a bounding box and set of other boxes."""
-    return jaccard(box.unsqueeze(0), other_boxes).squeeze(0)
+    # return jaccard(box.unsqueeze(0), other_boxes).squeeze(0)
+    return np.squeeze(jaccard(box[np.newaxis, :], other_boxes), axis=0)
+ 
